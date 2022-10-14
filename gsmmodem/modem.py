@@ -147,13 +147,15 @@ class GsmModem(SerialComms):
     CDSI_REGEX = re.compile('\+CDSI:\s*"([^"]+)",(\d+)$')
     CDS_REGEX  = re.compile('\+CDS:\s*([0-9]+)"$')
 
-    def __init__(self, port, baudrate=115200, incomingCallCallbackFunc=None, smsReceivedCallbackFunc=None, smsStatusReportCallback=None, requestDelivery=True, AT_CNMI="", *a, **kw):
+    def __init__(self, port, baudrate=115200, incomingCallCallbackFunc=None, smsReceivedCallbackFunc=None, smsStatusReportCallback=None, unhandledNotificationCallback=None, requestDelivery=True, AT_CNMI="", ignoredSupportedCommands=[], *a, **kw):
         super(GsmModem, self).__init__(port, baudrate, notifyCallbackFunc=self._handleModemNotification, *a, **kw)
         self.incomingCallCallback = incomingCallCallbackFunc or self._placeholderCallback
         self.smsReceivedCallback = smsReceivedCallbackFunc or self._placeholderCallback
         self.smsStatusReportCallback = smsStatusReportCallback or self._placeholderCallback
+        self.unhandledNotificationCallback = unhandledNotificationCallback or self._placeHolderCallback
         self.requestDelivery = requestDelivery
         self.AT_CNMI = AT_CNMI or "2,1,0,2"
+        self.ignoredSupportedCommands = ignoredSupportedCommands or []
         # Flag indicating whether caller ID for incoming call notification has been set up
         self._callingLineIdentification = False
         # Flag indicating whether incoming call notifications have extended information
@@ -558,9 +560,9 @@ class GsmModem(SerialComms):
                 commands = response[0]
                 if commands.startswith('+CLAC'):
                     commands = commands[6:] # remove the +CLAC: prefix before splitting
-                return commands.split(',')
+                return list(filter(lambda x: x not in self.ignoredSupportedCommands, commands.split(',')))
             elif len(response) > 2: # Multi-line response
-                return [removeAtPrefix(cmd.strip()) for cmd in response[:-1]]
+                return list(filter(lambda x: x not in self.ignoredSupportedCommands, [removeAtPrefix(cmd.strip()) for cmd in response[:-1]]))
             else:
                 self.log.debug('Unhandled +CLAC response: {0}'.format(response))
                 return None
@@ -577,6 +579,8 @@ class GsmModem(SerialComms):
 
             # Check all commands that will by considered
             for command in checkable_commands:
+                if command in self.ignoredSupportedCommands:
+                    continue
                 try:
                     # Compose AT command that will read values under specified function
                     at_command='AT'+command+'=?'
@@ -1227,8 +1231,31 @@ class GsmModem(SerialComms):
                         # Handle the update
                         handlerFunc(match)
                         return
+ 
+        # Handle CNMI mode=1. Incoming SMSs are in form ['+CMT:...', pdu]
+        if len(lines) > 1 and lines[0].startswith("+CMT:"):
+            try:
+                smsDict = decodeSmsPdu(lines[1])
+                if self.smsReceivedCallback is not None:
+                    stat = Sms.STATUS_RECEIVED_UNREAD
+                    if smsDict['type'] == 'SMS-DELIVER':
+                        sms = ReceivedSms(self, int(stat), smsDict['number'], smsDict['time'], smsDict['text'], smsDict['smsc'], smsDict.get('udh', []))
+                        self.smsReceivedCallback(sms)
+                        return
+                    elif smsDict['type'] == 'SMS-STATUS-REPORT':
+                        report = StatusReport(self, int(stat), smsDict['reference'], smsDict['number'], smsDict['time'], smsDict['discharge'], smsDict['status'])
+                        self.smsReceivedCallback(report)
+                        return
+                    else:
+                        self.log.debug('Invalid SMS PDU type from unsolicited modem notification: %s', smsDict['type'])
+                else:
+                    return
+            except EncodingError:
+                self.log.debug('Error decoding SMS PDU from unsolicited modem notification: %s', lines)
+
         # If this is reached, the notification wasn't handled
         self.log.debug('Unhandled unsolicited modem notification: %s', lines)
+        self.unhandledNotificationCallback(lines)
 
     #Simcom modem able detect incoming DTMF
     def _handleIncomingDTMF(self,line):
